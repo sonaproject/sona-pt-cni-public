@@ -1,0 +1,700 @@
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: onos-probe-scripts
+  namespace: kube-system
+data:
+  check-onos-status: |
+    #!/bin/bash
+    set -e
+    config=$(curl -s http://localhost:8181/onos/v1/cluster --user onos:rocks)
+    echo $config
+    printf '%q' $config | grep -q "READY"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sona-probe-scripts
+  namespace: kube-system
+data:
+  check-sona-status: |
+    #!/bin/bash
+    set -e
+    
+    while true
+    do
+      check_str='curl -sL --user onos:rocks -w "%{http_code}\\n" "http://localhost:8181/onos/k8snetworking/network/exist/1" -o /dev/null'
+      if [ $(eval $check_str) == "200" ];
+      then
+        break
+      else
+        sleep 5s
+      fi
+    done
+
+---
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: onos-config
+  namespace: kube-system
+data:
+  cluster.json: |-
+    {
+      "node": {
+          "ip": "127.0.0.1",
+          "id": "127.0.0.1",
+          "port": 9876
+      },
+      "storage": [
+          {
+              "ip": "127.0.0.1",
+              "id": "atomix-1",
+              "port": 5679
+          }
+      ],
+      "name": "onos"
+    }
+  component-cfg.json: |-
+    {
+      "org.onosproject.k8snode.impl.DefaultK8sNodeHandler": {
+        "ovsdbPortNum": 6650
+      }
+    }
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: atomix-probe-scripts
+  namespace: kube-system
+data:
+  check-atomix-status: |
+    #!/bin/bash
+    set -e
+    
+    while true
+    do
+      check_str='curl -sL -w "%{http_code}\\n" "http://localhost:5678/v1/status" -o /dev/null'
+      if [ $(eval $check_str) == "200" ];
+      then
+        break
+      else
+        sleep 5s
+      fi
+    done 
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cni-scripts
+  namespace: kube-system
+data:
+  check-node-state.sh: |
+    #!/bin/bash
+    set -e
+
+    while true
+    do
+      check_status_str='curl -sL --user onos:rocks -w "%{http_code}\\n" "http://localhost:8181/onos/k8snode/configure/get/postonboard/all" -o /dev/null'
+      if [ $(eval $check_status_str) = "200" ];
+      then
+        response_str='curl -sL --user onos:rocks http://localhost:8181/onos/k8snode/configure/get/postonboard/all'
+        number=$(echo $(eval $response_str) | grep "true" | wc -l)
+        if [ $number = 0 ];
+        then
+          echo "Date plane is not ready!"
+          sleep 5s
+        else
+          echo "Data plane is ready now!"
+          break
+        fi
+      else
+        echo "Failed to connect to control plane!"
+        sleep 5s
+      fi
+    done
+  check-control-plane.sh: |
+    #!/bin/bash
+    set -e
+
+    # Script to check whether the control plane is ready (ON_BOARDED state).
+    while true
+    do
+      check_status_str='curl -sL --user onos:rocks -w "%{http_code}\\n" "http://localhost:8181/onos/k8snode/configure/state/'$KUBERNETES_NODE_NAME'" -o /dev/null'
+      if [ $(eval $check_status_str) = "200" ];
+      then
+        response_str='curl -sL --user onos:rocks http://localhost:8181/onos/k8snode/configure/state/'$KUBERNETES_NODE_NAME
+        number=$(echo $(eval $response_str) | grep "ON_BOARDED" | wc -l)
+        if [ $number = 0 ];
+        then
+          echo "Control plane is not ready!"
+          sleep 5s
+        else
+          echo "Control plane is ready now!"
+          break
+        fi
+      else
+        echo "Failed to connect to control plane!"
+        sleep 5s
+      fi
+    done
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sona-pt
+  namespace: kube-system
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sona-pt
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get","list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: sona-pt
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: sona-pt
+subjects:
+- kind: ServiceAccount
+  name: sona-pt
+  namespace: kube-system
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-sona-pt
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      job: kube-sona-pt
+  template:
+    metadata:
+      labels:
+        job: kube-sona-pt
+    spec:
+      hostPID: true
+      hostNetwork: true
+      restartPolicy: Always
+      serviceAccountName: sona-pt
+      initContainers:
+        # This container checks the control plane (SONA) status. The container
+        # exits without error only if the control plane state is in ON_BOARD.
+        - name: check-control-plane
+          image: registry.gitlab.com/sonaproject/sona-pt-cni
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash","-c"]
+          args:
+            - /check-control-plane.sh;
+          env:
+            # Set the hostname based on the k8s node name.
+            - name: KUBERNETES_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+        volumeMounts:
+          - name: cni-scripts
+            mountPath: /check-control-plane.sh
+            subPath: check-control-plane.sh
+      containers:
+      - image: registry.gitlab.com/sonaproject/sona-pt-cni
+        imagePullPolicy: IfNotPresent
+        name: kube-sona-pt
+        securityContext:
+          privileged: true
+        envFrom:
+        - configMapRef:
+            name: install-config
+        command: ["/bin/sh"]
+        args: ["-c", "/sona-pt-cni/install-pt.sh"]
+        volumeMounts:
+        - name: config-host
+          mountPath: /pt-config
+        - name: binary-host
+          mountPath: /pt-binary
+        - name: kubelet-config
+          mountPath: /kubernetes
+        - name: log-vol
+          mountPath: /tmp
+        readinessProbe:
+          exec:
+            command:
+            - cat
+            - /tmp/readiness
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: config-host
+        hostPath:
+          path: /etc/cni/net.d
+      - name: binary-host
+        hostPath:
+          path: /opt/cni/bin
+      - name: kubelet-config
+        hostPath:
+          path: /etc/kubernetes
+      - name: log-vol
+        hostPath:
+          path: /var/log/cni-installer
+      - name: cni-scripts
+        configMap:
+          name: cni-scripts
+          defaultMode: 0744
+      tolerations:
+      - effect: NoSchedule
+        key: node-role.kubernetes.io/master
+      - effect: NoSchedule
+        key: node.kubernetes.io/not-ready
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-config-scripts
+  namespace: kube-system
+data:
+  convert-kube-config.py: |-
+    #!/usr/bin/env python
+
+    import json, yaml, sys, getopt
+
+    def main(argv):
+       inputfile = ''
+       hostfile = ''
+       outputfile = ''
+       try:
+           opts, args = getopt.getopt(argv,"ht:i:n:o:",["ifile=","hfile=","ofile="])
+       except getopt.GetoptError:
+          print ('convert-kube-config.py -i <inputfile> -n <hostfile> -o <outputfile>')
+          sys.exit(2)
+
+       for opt, arg in opts:
+          if opt == '-h':
+             print ('convert-kube-config.py -i <inputfile> -n <hostfile> -o <outputfile>')
+             sys.exit()
+          elif opt in ("-i", "--ifile"):
+             inputfile = arg
+          elif opt in ("-n", "--hfile"):
+             hostfile = arg
+          elif opt in ("-o", "--ofile"):
+             outputfile = arg
+
+       hostinfo = ""
+       with open(hostfile, 'r') as json_file:
+          data = json.load(json_file)
+          hostinfo = data['hostNodesInfo']
+
+       with open(inputfile, 'r') as stream:
+          try:
+             raw = yaml.safe_load(stream)
+             clusters = raw["clusters"]
+             cluster = clusters[0]["cluster"]
+             ca_cert_data = cluster["certificate-authority-data"]
+             server = cluster["server"]
+             scheme = server.split(":")[0].upper()
+             ip_address = server.split(":")[1].replace('//', '')
+             port = server.split(":")[2]
+
+             users = raw["users"]
+             user = users[0]["user"]
+             client_cert_data = user["client-certificate-data"]
+             client_key_data = user["client-key-data"]
+
+             api_configs = {
+                "scheme": scheme,
+                "ipAddress": ip_address,
+                "port": int(port),
+                "dvr": True,
+                "mode": "PASSTHROUGH",
+                "extNetworkCidr": "172.40.0.0/24",
+                "segmentId": 188,
+                "caCertData": ca_cert_data,
+                "clientCertData": client_cert_data,
+                "clientKeyData": client_key_data,
+                "hostNodesInfo": hostinfo
+             }
+             data = {
+                "apiConfigs": [
+                   api_configs
+                ]
+             }
+          except yaml.YAMLError as exc:
+             print(exc)
+
+       with open(outputfile, "w") as jsonfile:
+          json.dump(data, jsonfile)
+
+    if __name__ == "__main__":
+       main(sys.argv[1:])
+
+---
+# This ConfigMap is used to configure a self-hosted atomix installation.
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: atomix-config
+  namespace: kube-system
+data:
+  atomix.json: |-
+    {
+      "cluster": {
+        "node": {
+            "id": "atomix-1",
+            "address": "127.0.0.1:5679"
+        },
+        "clusterId": "onos",
+        "discovery": {
+            "nodes": [
+                {
+                    "id": "atomix-1",
+                    "address": "127.0.0.1:5679"
+                }
+            ],
+            "type": "bootstrap"
+        }
+      },
+      "partitionGroups": {
+        "raft": {
+            "partitionSize": 3,
+            "type": "raft",
+            "members": [
+                "atomix-1"
+            ],
+            "partitions": 1
+        }
+      },
+      "managementGroup": {
+        "partitionSize": 1,
+        "type": "raft",
+        "members": [
+            "atomix-1"
+        ],
+        "partitions": 1
+      }
+    }
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sona-atomix
+  namespace: kube-system
+  labels:
+    k8s-app: atomix
+spec:
+  serviceName: sona-atomix
+  selector:
+    matchLabels:
+      k8s-app: atomix
+  replicas: 1
+  podManagementPolicy: Parallel
+  template:
+    metadata:
+      name: sona-atomix
+      namespace: kube-system
+      labels:
+        k8s-app: atomix
+    spec:
+      hostNetwork: true
+      tolerations:
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoSchedule
+      nodeSelector:
+        node-role.kubernetes.io/master: ""
+
+      # These containers are run during pod initialization
+      initContainers:
+      - name: atomix-init
+        image: busybox
+        command: ["/bin/sh", "-c", "echo $ATOMIX_JSON > /tmp/atomix.json; cat /tmp/atomix.json"]
+        env:
+          - name: ATOMIX_JSON
+            valueFrom:
+              configMapKeyRef:
+                name: atomix-config
+                key: atomix.json
+        volumeMounts:
+          - name: config
+            mountPath: /tmp
+            readOnly: false
+      containers:
+      - name: atomix
+        image: opensona/atomix-docker:dev
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: JAVA_OPTS
+          value: -Xmx2G
+        ports:
+        - name: client
+          containerPort: 5678
+        - name: server
+          containerPort: 5679
+        readinessProbe:
+          httpGet:
+            path: /v1/status
+            port: 5678
+          initialDelaySeconds: 10
+          timeoutSeconds: 10
+          failureThreshold: 6
+        livenessProbe:
+          httpGet:
+            path: /v1/status
+            port: 5678
+          initialDelaySeconds: 60
+          timeoutSeconds: 10
+        volumeMounts:
+          - name: config
+            mountPath: /root/atomix/config
+            readOnly: true
+      volumes:
+      - name: config
+        hostPath:
+          path: /tmp/atomix-config
+          type: DirectoryOrCreate
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sona-onos
+  namespace: kube-system
+  labels:
+    k8s-app: onos
+spec:
+  serviceName: sona-onos
+  selector:
+    matchLabels:
+      k8s-app: onos
+  replicas: 1
+  template:
+    metadata:
+      name: sona-onos
+      namespace: kube-system
+      labels:
+        k8s-app: onos
+    spec:
+      hostNetwork: true
+      tolerations:
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoSchedule
+      nodeSelector:
+        node-role.kubernetes.io/master: ""
+
+      # These containers are run during pod initialization
+      initContainers:
+      - name: onos-init
+        image: opensona/sona-cni:latest
+        command: ["/bin/sh", "-c"] 
+        args:
+          - echo $CLUSTER_JSON > /tmp/cluster.json.tmp;
+            /replace-master-ip -i /tmp/cluster.json.tmp -o /tmp/cluster.json;
+            cat /tmp/cluster.json;
+            echo $COMPONENT_CONFIG_JSON > /tmp/component-cfg.json;
+            cat /tmp/component-cfg.json;
+        env:
+          - name: CLUSTER_JSON
+            valueFrom:
+              configMapKeyRef:
+                name: onos-config
+                key: cluster.json
+          - name: COMPONENT_CONFIG_JSON
+            valueFrom:
+              configMapKeyRef:
+                name: onos-config
+                key: component-cfg.json
+        volumeMounts:
+          - name: config
+            mountPath: /tmp
+            readOnly: false
+          - mountPath: /root/.kube/config
+            name: kube-config-file
+      - name: atomix-readiness-probe
+        image: opensona/python-docker
+        command: ["/bin/sh", "-c"]
+        args:
+          - /tmp/check-atomix-status ;
+            sleep 10
+        volumeMounts:
+          - name: atomix-probe-scripts
+            mountPath: /tmp/check-atomix-status
+            subPath: check-atomix-status
+      containers:
+      - name: onos
+        image: opensona/onos-sona-nightly-docker:dev
+        imagePullPolicy: Always
+        env:
+        - name: JAVA_OPTS
+          value: -Xmx2G
+        ports:
+        - name: openflow
+          containerPort: 6653
+        - name: ovsdb
+          containerPort: 6640
+        - name: east-west
+          containerPort: 9876
+        - name: cli
+          containerPort: 8101
+        - name: ui
+          containerPort: 8181
+        readinessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - /root/onos/bin/check-onos-status
+          initialDelaySeconds: 30
+          periodSeconds: 15
+          failureThreshold: 10
+        livenessProbe:
+          exec:
+            command:
+            - sh
+            - -c
+            - /root/onos/bin/check-onos-status
+          initialDelaySeconds: 300
+          periodSeconds: 15
+          timeoutSeconds: 5
+        volumeMounts:
+          - name: onos-probe-scripts
+            mountPath: /root/onos/bin/check-onos-status
+            subPath: check-onos-status
+          - name: config
+            mountPath: /root/onos/config
+            readOnly: true
+      volumes:
+      - name: onos-probe-scripts
+        configMap:
+          name: onos-probe-scripts
+          defaultMode: 0744
+      - name: atomix-probe-scripts
+        configMap:
+          name: atomix-probe-scripts
+          defaultMode: 0744
+      - name: config
+        hostPath:
+          path: /tmp/onos-config
+          type: DirectoryOrCreate
+      - name: kube-config-file
+        hostPath:
+          path: /root/.kube/config
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: sona-onos-config
+  namespace: kube-system
+  labels:
+    k8s-app: onos-config
+spec:
+  serviceName: sona-onos-config
+  selector:
+    matchLabels:
+      k8s-app: onos-config
+  replicas: 1
+  template:
+    metadata:
+      name: sona-onos-config
+      namespace: kube-system
+      labels:
+        k8s-app: onos-config
+    spec:
+      hostNetwork: true
+      tolerations:
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoSchedule
+      nodeSelector:
+        node-role.kubernetes.io/master: ""
+
+      initContainers:
+      - name: sona-readiness-probe
+        image: opensona/python-docker
+        command: ["/bin/sh", "-c"]
+        args:
+          - /tmp/check-sona-status ;
+            sleep 30
+        volumeMounts:
+          - name: sona-probe-scripts
+            mountPath: /tmp/check-sona-status
+            subPath: check-sona-status
+      containers:
+      - name: onos-config
+        image: opensona/python-docker
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args:
+          - /root/onos/bin/convert-kube-config.py -i /root/onos/kube_admin.conf -n /root/onos/hostNodesInfo.json -o /tmp/onos_config.json ;
+            curl --user onos:rocks -X POST -H "Content-Type:application/json" http://127.0.0.1:8181/onos/k8snode/configure/api -d @/tmp/onos_config.json ;
+            /check-node-state.sh ;
+            curl --user onos:rocks -X GET http://127.0.0.1:8181/onos/k8snetworking/management/sync/states ;
+            curl --user onos:rocks -X GET http://127.0.0.1:8181/onos/k8snode/configure/init/all ;
+            sleep 30 ;
+            curl --user onos:rocks -X GET http://127.0.0.1:8181/onos/k8snetworking/management/sync/rules ;
+            while true ; do sleep 10 ; done
+        volumeMounts:
+          - name: config-scripts
+            mountPath: /root/onos/bin/convert-kube-config.py
+            subPath: convert-kube-config.py
+          - name: kube-home
+            mountPath: /root/onos/kube_admin.conf
+            subPath: admin.conf
+          - name: config
+            mountPath: /tmp
+            readOnly: false
+          - name: tmp-dir
+            mountPath: /root/onos/hostNodesInfo.json
+            subPath: hostNodesInfo.json
+          - name: cni-scripts
+            mountPath: /check-node-state.sh
+            subPath: check-node-state.sh
+      volumes:
+        - name: config-scripts
+          configMap:
+            name: kube-config-scripts
+            defaultMode: 0744
+        - name: sona-probe-scripts
+          configMap:
+            name: sona-probe-scripts
+            defaultMode: 0744
+        - name: cni-scripts
+          configMap:
+            name: cni-scripts
+            defaultMode: 0744
+        - name: config
+          hostPath:
+            path: /tmp/onos-config
+        - name: kube-home
+          hostPath:
+            path: /etc/kubernetes/
+        - name: tmp-dir
+          hostPath:
+            path: /tmp/

@@ -35,9 +35,10 @@ data:
       fi
     done
 
+
 ---
-kind: ConfigMap
 apiVersion: v1
+kind: ConfigMap
 metadata:
   name: onos-config
   namespace: kube-system
@@ -143,7 +144,17 @@ data:
         sleep 5s
       fi
     done
+  update-post-onboard-state.sh: |
+    #!/bin/bash
+    set -e
 
+    update_state_str='curl -sL --user onos:rocks -X PUT -w "%{http_code}\\n" "http://'$ONOS_IP':8181/onos/k8snode/configure/update/postonboard/'$KUBERNETES_NODE_NAME'" -o /dev/null'
+    if [ $(eval $update_state_str) = "200" ];
+    then
+      echo "Successfully marked the control plane state as post-onboarded."
+    else
+      echo "Failed to mark the control plane state as post-onboarded. "
+    fi
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -159,7 +170,7 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["nodes"]
-  verbs: ["get","list"]
+  verbs: ["get", "list", "patch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -215,10 +226,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-        volumeMounts:
-          - name: cni-scripts
-            mountPath: /check-control-plane.sh
-            subPath: check-control-plane.sh
+          volumeMounts:
+            - name: cni-scripts
+              mountPath: /check-control-plane.sh
+              subPath: check-control-plane.sh
       containers:
       - image: registry.gitlab.com/sonaproject/sona-pt-cni
         imagePullPolicy: IfNotPresent
@@ -228,8 +239,23 @@ spec:
         envFrom:
         - configMapRef:
             name: install-config
-        command: ["/bin/sh"]
-        args: ["-c", "/sona-pt-cni/install-pt.sh"]
+        env:
+            # Set the master node IP address
+            - name: ONOS_IP
+              valueFrom:
+                configMapKeyRef:
+                  name: install-config
+                  key: OnosIP
+            # Set the hostname based on the k8s node name.
+            - name: KUBERNETES_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+        command: ["/bin/sh", "-c"]
+        args: 
+          - /sona-pt-cni/install-pt.sh ;
+            sleep 60 ;
+            /update-post-onboard-state.sh ;
         volumeMounts:
         - name: config-host
           mountPath: /pt-config
@@ -237,6 +263,9 @@ spec:
           mountPath: /pt-binary
         - name: kubelet-config
           mountPath: /kubernetes
+        - name: cni-scripts
+          mountPath: /update-post-onboard-state.sh
+          subPath: update-post-onboard-state.sh
         - name: log-vol
           mountPath: /tmp
         readinessProbe:

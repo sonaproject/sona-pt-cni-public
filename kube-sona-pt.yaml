@@ -547,10 +547,7 @@ spec:
         image: opensona/sona-cni:latest
         command: ["/bin/sh", "-c"] 
         args:
-          - echo $CLUSTER_JSON > /tmp/cluster.json.tmp;
-            /replace-master-ip -i /tmp/cluster.json.tmp -o /tmp/cluster.json;
-            cat /tmp/cluster.json;
-            echo $COMPONENT_CONFIG_JSON > /tmp/component-cfg.json;
+          - echo $COMPONENT_CONFIG_JSON > /tmp/component-cfg.json;
             cat /tmp/component-cfg.json;
         env:
           - name: CLUSTER_JSON
